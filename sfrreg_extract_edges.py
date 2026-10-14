@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -365,6 +366,87 @@ def fit_edge_lines(img: np.ndarray, cx: float, cy: float, radius: float) -> tupl
     return vert, horz
 
 
+def fit_centered_edge_lines(
+    img: np.ndarray,
+    cx: float,
+    cy: float,
+    radius: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit the crossing edges in the central band of a validated mark.
+
+    Strong fisheye distortion can make the circular rim sharper than an
+    internal half-edge.  Restricting this fallback fit to the middle of the
+    mark prevents the rim from attracting the line fit.
+    """
+    gx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
+    h, w = img.shape
+    span = max(8, int(round(0.50 * radius)))
+    band = max(6, int(round(0.42 * radius)))
+
+    def subpixel_peak(values: np.ndarray, index: int) -> float:
+        if index <= 0 or index >= len(values) - 1:
+            return 0.0
+        left, middle, right = values[index - 1 : index + 2]
+        denominator = left - 2.0 * middle + right
+        if abs(denominator) < 1e-9:
+            return 0.0
+        return float(np.clip(0.5 * (left - right) / denominator, -0.5, 0.5))
+
+    vertical_rows: list[float] = []
+    vertical_x: list[float] = []
+    for row in range(max(1, int(cy) - span), min(h - 1, int(cy) + span + 1)):
+        if abs(row - cy) < 3:
+            continue
+        start = max(1, int(math.floor(cx - band)))
+        stop = min(w - 1, int(math.ceil(cx + band)) + 1)
+        magnitudes = np.abs(gx[row, start:stop])
+        if magnitudes.size < 6:
+            continue
+        index = int(np.argmax(magnitudes))
+        if magnitudes[index] < 8:
+            continue
+        vertical_rows.append(float(row))
+        vertical_x.append(start + index + subpixel_peak(magnitudes, index))
+
+    horizontal_cols: list[float] = []
+    horizontal_y: list[float] = []
+    for column in range(max(1, int(cx) - span), min(w - 1, int(cx) + span + 1)):
+        if abs(column - cx) < 3:
+            continue
+        start = max(1, int(math.floor(cy - band)))
+        stop = min(h - 1, int(math.ceil(cy + band)) + 1)
+        magnitudes = np.abs(gy[start:stop, column])
+        if magnitudes.size < 6:
+            continue
+        index = int(np.argmax(magnitudes))
+        if magnitudes[index] < 8:
+            continue
+        horizontal_cols.append(float(column))
+        horizontal_y.append(start + index + subpixel_peak(magnitudes, index))
+
+    def robust_fit(independent: list[float], dependent: list[float]) -> np.ndarray:
+        if len(independent) < 8:
+            raise RuntimeError("could not localise a centred crossing edge")
+        x = np.asarray(independent, dtype=np.float64)
+        y = np.asarray(dependent, dtype=np.float64)
+        coefficients = np.polyfit(x, y, 1)
+        residuals = y - np.polyval(coefficients, x)
+        median_residual = float(np.median(residuals))
+        mad = float(np.median(np.abs(residuals - median_residual)))
+        cutoff = max(1.5, 3.0 * 1.4826 * mad)
+        keep = np.abs(residuals - median_residual) <= cutoff
+        if int(keep.sum()) >= 8:
+            coefficients = np.polyfit(x[keep], y[keep], 1)
+        return coefficients
+
+    # x = a*y+b and y = a*x+b, matching fit_edge_lines().
+    return (
+        robust_fit(vertical_rows, vertical_x),
+        robust_fit(horizontal_cols, horizontal_y),
+    )
+
+
 def line_intersection(vert: np.ndarray, horz: np.ndarray) -> tuple[float, float]:
     """Intersection of x = av*y + bv and y = ah*x + bh."""
     av, bv = float(vert[0]), float(vert[1])
@@ -532,19 +614,180 @@ def roi_dict(
     }
 
 
+def enforce_continuous_edge_support(
+    img: np.ndarray,
+    mark: dict,
+    roi: dict,
+    minimum_support: float = 0.90,
+    maximum_platform_uniformity: float = 0.13,
+) -> dict:
+    """Trim a half-edge ROI until the complete rectangle stays in the mark.
+
+    A valid edge must have the same polarity on at least ``minimum_support``
+    of its scan lines and must reach both ROI end borders.  The black and
+    white platforms on either side of the edge must also remain uniform;
+    this rejects scan lines where the curved disk boundary enters an outer
+    corner of the rectangular ROI.
+    """
+    smooth = cv2.GaussianBlur(img.astype(np.float64), (3, 3), 0)
+    gradient_x = cv2.Sobel(smooth, cv2.CV_64F, 1, 0, ksize=3)
+    gradient_y = cv2.Sobel(smooth, cv2.CV_64F, 0, 1, ksize=3)
+    x1, y1, x2, y2 = (int(value) for value in roi["xyxy"])
+    vertical = roi["orientation"] == "vertical"
+    coefficients = mark["vert"] if vertical else mark["horz"]
+    along = list(range(y1, y2)) if vertical else list(range(x1, x2))
+    if roi["name"] in ("T", "L"):
+        along.reverse()  # Always inspect from the junction towards the rim.
+
+    evidence: list[tuple[int, float, float, float]] = []
+    exclusion = 3.0
+    for position in along:
+        predicted = float(coefficients[0] * position + coefficients[1])
+        if vertical:
+            normal = int(round(predicted))
+            lo = max(x1, normal - 2)
+            hi = min(x2, normal + 3)
+            first_stop = min(x2, int(math.floor(predicted - exclusion)) + 1)
+            second_start = max(x1, int(math.ceil(predicted + exclusion)))
+            first = smooth[position, x1:first_stop]
+            second = smooth[position, second_start:x2]
+            gradient = gradient_x[position, lo:hi]
+        else:
+            normal = int(round(predicted))
+            lo = max(y1, normal - 2)
+            hi = min(y2, normal + 3)
+            first_stop = min(y2, int(math.floor(predicted - exclusion)) + 1)
+            second_start = max(y1, int(math.ceil(predicted + exclusion)))
+            first = smooth[y1:first_stop, position]
+            second = smooth[second_start:y2, position]
+            gradient = gradient_y[lo:hi, position]
+        if first.size < 2 or second.size < 2 or gradient.size == 0:
+            evidence.append((position, 0.0, 0.0, float("inf")))
+            continue
+        signed_contrast = float(second.mean() - first.mean())
+        edge_strength = float(np.max(np.abs(gradient)))
+        platform_uniformity = max(float(first.std()), float(second.std())) / (
+            abs(signed_contrast) + 1e-9
+        )
+        evidence.append(
+            (position, signed_contrast, edge_strength, platform_uniformity)
+        )
+
+    usable = [
+        (contrast, strength)
+        for _, contrast, strength, _ in evidence
+        if strength >= 8.0 and abs(contrast) >= 5.0
+    ]
+    if not usable:
+        raise RuntimeError(f"{roi['name']} ROI has no continuous edge evidence")
+    polarity = 1.0 if float(np.median([value[0] for value in usable])) >= 0 else -1.0
+    reference_contrast = float(np.median([abs(value[0]) for value in usable]))
+    minimum_contrast = max(5.0, 0.55 * reference_contrast)
+    valid = [
+        strength >= 8.0
+        and contrast * polarity >= minimum_contrast
+        and uniformity <= maximum_platform_uniformity
+        for _, contrast, strength, uniformity in evidence
+    ]
+
+    minimum_length = 16
+    best: tuple[int, int, int] | None = None
+    for start in range(0, len(valid) - minimum_length + 1):
+        if not valid[start]:
+            continue
+        for end in range(len(valid) - 1, start + minimum_length - 2, -1):
+            if not valid[end]:
+                continue
+            segment = valid[start : end + 1]
+            support_count = sum(segment)
+            if support_count / len(segment) < minimum_support:
+                continue
+            candidate = (len(segment), -start, end)
+            if best is None or candidate > best:
+                best = candidate
+            break
+    if best is None:
+        raise RuntimeError(
+            f"{roi['name']} ROI edge does not reach both endpoints "
+            f"({minimum_support:.0%} support required)"
+        )
+
+    length, negative_start, end = best
+    start = -negative_start
+    # Keep one extra scan line between the ROI border and a detected rim so
+    # both outer corners stay inside the mark.
+    boundary_was_detected = end < len(valid) - 1
+    if boundary_was_detected and end - start + 1 > minimum_length:
+        safe_end = end - 1
+        while safe_end > start + minimum_length - 1 and not valid[safe_end]:
+            safe_end -= 1
+        if valid[safe_end] and safe_end - start + 1 >= minimum_length:
+            end = safe_end
+            length = end - start + 1
+
+    selected_positions = [entry[0] for entry in evidence[start : end + 1]]
+    along1 = min(selected_positions)
+    along2 = max(selected_positions) + 1
+    original_box = [x1, y1, x2, y2]
+    if vertical:
+        y1, y2 = along1, along2
+        midpoint = 0.5 * (y1 + y2 - 1)
+        edge_x = float(coefficients[0] * midpoint + coefficients[1])
+        edge_y = midpoint
+    else:
+        x1, x2 = along1, along2
+        midpoint = 0.5 * (x1 + x2 - 1)
+        edge_x = midpoint
+        edge_y = float(coefficients[0] * midpoint + coefficients[1])
+    crop = img[y1:y2, x1:x2]
+    support = sum(valid[start : end + 1]) / length
+    maximum_uniformity = max(entry[3] for entry in evidence[start : end + 1])
+    roi.update(
+        {
+            "x": x1,
+            "y": y1,
+            "w": x2 - x1,
+            "h": y2 - y1,
+            "xyxy": [x1, y1, x2, y2],
+            "imatest_ltrb_1based": [x1 + 1, y1 + 1, x2, y2],
+            "edge_center": [edge_x, edge_y],
+            "mean": float(crop.mean()),
+            "min": float(crop.min()),
+            "max": float(crop.max()),
+            "edge_support": support,
+            "edge_platform_uniformity_max": maximum_uniformity,
+            "edge_endpoint_evidence": True,
+            "edge_support_original_xyxy": original_box,
+            "edge_support_trimmed": original_box != [x1, y1, x2, y2],
+        }
+    )
+    return roi
+
+
 def detect_marks(
     img: np.ndarray,
     min_diameter_frac: float,
     max_diameter_frac: float,
     expected: int,
     max_slant_deg: float = 20.0,
+    min_rim_ratio: float = 1.8,
+    peak_threshold_frac: float = 0.18,
+    quadrant_mismatch_ratio: float = 0.65,
+    center_prior_scale: float | None = None,
 ) -> list[dict]:
+    """Detect and validate SFRreg marks.
+
+    The optional thresholds allow a caller to tune candidate generation and
+    validation for a capture set without reimplementing the detector.  Set
+    ``center_prior_scale`` to a fraction of the shorter image dimension to
+    prefer central marks when strong peripheral structures create candidates.
+    """
     h, w = img.shape
     min_r = max(8, int(round(min_diameter_frac * h / 2.0)))
     max_r = max(min_r + 4, int(round(max_diameter_frac * min(h, w) / 2.0)))
     scales = sorted(set(max(3, int(round(0.40 * r))) for r in range(min_r, max_r + 1, 2)))
     resp = saddle_map(img, scales)
-    thr = max(8.0, 0.18 * float(resp.max()))
+    thr = max(8.0, peak_threshold_frac * float(resp.max()))
     peaks = nms_peaks(resp, min_dist=max(10, min_r), threshold=thr)
     marks: list[dict] = []
     for score, x, y in peaks:
@@ -552,7 +795,11 @@ def detect_marks(
             cx, cy, hscore, phase = refine_center(img, float(x), float(y), r_hint=2.0 * min_r)
             radii, stds = ring_std_profile(img, cx, cy, r_max=max_r * 1.2)
             r_drop = radius_from_contrast_drop(radii, stds)
-            r_harm = harmonic_ok_until(img, cx, cy, r_guess=r_drop or (2 * min_r))
+            search_hint = min(
+                max_r / 1.4,
+                max(2.0 * min_r, r_drop or 0.0),
+            )
+            r_harm = harmonic_ok_until(img, cx, cy, r_guess=search_hint)
             cands = [v for v in (r_drop, r_harm) if v and min_r <= v <= max_r]
             if not cands:
                 continue
@@ -570,20 +817,57 @@ def detect_marks(
             if n_zero_crossings(vals) not in (4, 6):  # 4 ideal; 6 if a sample hits the exact edge
                 continue
             contrast, mismatch = quadrant_polarity(img, cx, cy, radius, ang)
-            if contrast < 12.0 or mismatch > 0.65 * contrast:
+            if contrast < 12.0 or mismatch > quadrant_mismatch_ratio * contrast:
                 continue
-            if rim_ratio(img, cx, cy, radius) < 1.8:
+            measured_rim_ratio = rim_ratio(img, cx, cy, radius)
+            if measured_rim_ratio < min_rim_ratio:
                 continue
-            vert, horz = fit_edge_lines(img, cx, cy, radius)
-            ix, iy = line_intersection(vert, horz)
-            if abs(ix - cx) < 5 and abs(iy - cy) < 5:
+
+            try:
+                vert, horz = fit_edge_lines(img, cx, cy, radius)
+                ix, iy = line_intersection(vert, horz)
+                original_offset = math.hypot(ix - cx, iy - cy)
+            except RuntimeError:
+                vert, horz = fit_centered_edge_lines(img, cx, cy, radius)
+                ix, iy = line_intersection(vert, horz)
+                original_offset = float("inf")
+
+            # Prefer the centre-band fit when the full-mark fit has locked on
+            # to the outer ellipse rather than an internal crossing edge.
+            if original_offset > max(5.0, 0.10 * radius):
+                try:
+                    centered_vert, centered_horz = fit_centered_edge_lines(
+                        img, cx, cy, radius
+                    )
+                    centered_x, centered_y = line_intersection(
+                        centered_vert, centered_horz
+                    )
+                    centered_offset = math.hypot(
+                        centered_x - cx, centered_y - cy
+                    )
+                    if centered_offset < original_offset:
+                        vert, horz = centered_vert, centered_horz
+                        ix, iy = centered_x, centered_y
+                except RuntimeError:
+                    pass
+            if (
+                abs(ix - cx) < max(5.0, 0.15 * radius)
+                and abs(iy - cy) < max(5.0, 0.15 * radius)
+            ):
                 cx, cy = float(ix), float(iy)
-            v_ang = float(np.degrees(np.arctan(vert[0])))
-            h_ang = float(np.degrees(np.arctan(horz[0])))
+            v_ang = math.degrees(math.atan(float(vert[0])))
+            h_ang = math.degrees(math.atan(float(horz[0])))
             # Imatest default favours roughly H/V edges (about 2–15° of slant).
             if abs(v_ang) > max_slant_deg or abs(h_ang) > max_slant_deg:
                 continue
             quality = float(ratio) * float(std) * float(contrast) / (1.0 + mismatch)
+            selection_score = quality
+            if center_prior_scale is not None and center_prior_scale > 0:
+                center_distance = math.hypot(cx - w / 2.0, cy - h / 2.0)
+                center_scale = center_prior_scale * min(w, h)
+                selection_score = quality / (
+                    1.0 + (center_distance / center_scale) ** 2
+                )
             marks.append(
                 {
                     "center": [float(cx), float(cy)],
@@ -591,9 +875,11 @@ def detect_marks(
                     "saddle": float(score),
                     "harmonic2": float(ratio),
                     "ring_std": float(std),
-                    "phase_deg": float(np.degrees(ang)),
+                    "phase_deg": math.degrees(float(ang)),
                     "quadrant_contrast": float(contrast),
+                    "rim_ratio": float(measured_rim_ratio),
                     "quality": quality,
+                    "selection_score": selection_score,
                     "vert_coeffs": [float(vert[0]), float(vert[1])],
                     "horz_coeffs": [float(horz[0]), float(horz[1])],
                     "vert_slant_deg": v_ang,
@@ -602,11 +888,11 @@ def detect_marks(
                     "horz": horz,
                 }
             )
-        except RuntimeError:
+        except (RuntimeError, ValueError, ArithmeticError):
             continue
 
     # Keep the better of overlapping detections.
-    marks.sort(key=lambda m: m["quality"], reverse=True)
+    marks.sort(key=lambda m: m["selection_score"], reverse=True)
     filtered: list[dict] = []
     for m in marks:
         cx, cy = m["center"]
@@ -839,6 +1125,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-diameter-frac", type=float, default=0.45, help="最大直径 / min(宽,高)")
     p.add_argument("--expected-marks", type=int, default=0, help="期望的注册标数量，0 表示全部")
     p.add_argument("--max-slant", type=float, default=20.0, help="相对水平/垂直的最大倾斜角（度），Imatest 默认约 ±15°")
+    p.add_argument("--min-rim-ratio", type=float, default=1.8, help="圆内/圆外环对比度比最小值（默认：1.8）")
+    p.add_argument("--peak-threshold-frac", type=float, default=0.18, help="鞍点候选阈值/全图最大响应（默认：0.18）")
+    p.add_argument("--quadrant-mismatch-ratio", type=float, default=0.65, help="象限极性失配/对比度最大值（默认：0.65）")
+    p.add_argument("--center-prior-scale", type=float, default=None, help="中心先验尺度/短边；不指定则只按检测质量排序")
     p.add_argument("--no-inset", action="store_true", help="原图标注不嵌入放大插图")
     return p.parse_args(argv)
 
@@ -858,6 +1148,10 @@ def main(argv: list[str] | None = None) -> int:
         max_diameter_frac=args.max_diameter_frac,
         expected=args.expected_marks,
         max_slant_deg=args.max_slant,
+        min_rim_ratio=args.min_rim_ratio,
+        peak_threshold_frac=args.peak_threshold_frac,
+        quadrant_mismatch_ratio=args.quadrant_mismatch_ratio,
+        center_prior_scale=args.center_prior_scale,
     )
     if not marks:
         print("error: no SFRreg registration mark found", file=sys.stderr)
@@ -877,6 +1171,8 @@ def main(argv: list[str] | None = None) -> int:
             roi_length_pct=args.roi_length_pct,
             width_ratio=width_ratio,
         )
+        for roi in rois:
+            enforce_continuous_edge_support(gray, mark, roi)
         rois_per_mark.append(rois)
         cx, cy = mark["center"]
         print(
